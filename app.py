@@ -1,173 +1,191 @@
 import streamlit as st
 import pandas as pd
 from deep_translator import GoogleTranslator
-from langdetect import detect as detect_lang
 import io
 import time
-import random
+import base64
+from docx import Document
+import fitz  # PyMuPDF
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="Universal Multi-Sheet Translator", layout="wide", page_icon="🌍")
+# --- 1. LANGUAGE MAPPING ---
+# Comprehensive mapping for human-friendly selection
+LANG_MAP = {
+    "Auto Detect": "auto", "English": "en", "French": "fr", "Spanish": "es", 
+    "German": "de", "Italian": "it", "Portuguese": "pt", "Chinese (Simplified)": "zh-CN",
+    "Japanese": "ja", "Korean": "ko", "Russian": "ru", "Arabic": "ar", 
+    "Hindi": "hi", "Turkish": "tr", "Dutch": "nl", "Greek": "el"
+}
+INV_LANG_MAP = {v: k for k, v in LANG_MAP.items()}
 
-if "local_cache" not in st.session_state:
-    st.session_state.local_cache = {}
+# --- 2. CONFIGURATION & THEME ---
+st.set_page_config(page_title="Translet Pro", layout="wide", page_icon=".")
+if "step" not in st.session_state: st.session_state.step = "welcome"
+if "local_cache" not in st.session_state: st.session_state.local_cache = {}
+if "history" not in st.session_state: st.session_state.history = []
 
-# --- 2. ROBUST FILE HANDLING ---
-def read_csv_robust(file):
-    encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
-    for enc in encodings:
-        try:
-            file.seek(0)
-            return pd.read_csv(file, encoding=enc)
-        except:
-            continue
-    file.seek(0)
-    return pd.read_csv(file, encoding='utf-8', errors='replace')
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    div.stButton > button:first-child {
+        background-color: #007AFF; color: white; border-radius: 12px;
+        padding: 0.6rem 2rem; font-weight: 600; border: none;
+    }
+    .splash-card {
+        background: white; padding: 3rem; border-radius: 25px;
+        box-shadow: 0 15px 35px rgba(0,0,0,0.05); text-align: center;
+        max-width: 800px; margin: auto;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- 3. TRANSLATION CORE WITH RETRIES & CHUNKING ---
-def translate_batch(texts, source_lang, target_lang, ticker_placeholder):
-    lang_pair = f"{source_lang}-{target_lang}".lower()
-    results = {t: t for t in texts} # Default to original text on failure
-    
-    # Filter for unique, non-empty, non-cached strings
-    to_translate = []
-    for t in texts:
-        clean_text = str(t).strip() if pd.notnull(t) else ""
-        if clean_text and any(c.isalpha() for c in clean_text):
-            if (lang_pair, clean_text) in st.session_state.local_cache:
-                results[t] = st.session_state.local_cache[(lang_pair, clean_text)]
-            else:
-                to_translate.append(clean_text)
-
-    if not to_translate:
-        return [results[t] for t in texts]
-
-    unique_list = list(set(to_translate))
-    chunk_size = 15  # Small chunks to avoid triggering Google's bot detection
-    translated_map = {}
-
-    translator = GoogleTranslator(source=source_lang, target=target_lang)
-
-    for i in range(0, len(unique_list), chunk_size):
-        chunk = unique_list[i : i + chunk_size]
-        ticker_placeholder.info(f"⏳ Progress: {i}/{len(unique_list)} unique strings...")
-        
-        # Retry Logic (Exponential Backoff)
-        max_retries = 3
-        success = False
-        
-        for attempt in range(max_retries):
-            try:
-                # Add a tiny jitter delay between chunks to look "human"
-                time.sleep(random.uniform(0.5, 1.5))
-                
-                translated_chunk = translator.translate_batch(chunk)
-                for orig, trans in zip(chunk, translated_chunk):
-                    translated_map[orig] = trans
-                    st.session_state.local_cache[(lang_pair, orig)] = trans
-                success = True
-                break 
-            except Exception as e:
-                wait_time = (2 ** attempt) + random.random()
-                ticker_placeholder.warning(f"⚠️ Connection glitch. Retrying in {wait_time:.1f}s... ({e})")
-                time.sleep(wait_time)
-        
-        if not success:
-            ticker_placeholder.error(f"❌ Failed to translate chunk starting with: {str(chunk[0])[:30]}")
-            for item in chunk:
-                translated_map[item] = item
-
-    return [translated_map.get(str(t).strip(), t) if pd.notnull(t) else t for t in texts]
-
-# --- 4. UI LAYOUT ---
-st.title("🌍 Universal Multi-Sheet Translator")
-st.markdown("Upload files. This version includes **Auto-Retry** and **Rate-Limit protection**.")
-
+# --- 3. SIDEBAR ---
 with st.sidebar:
-    st.header("Settings")
-    if st.button("🗑️ Clear Session Cache"):
-        st.session_state.local_cache = {}
-        st.success("Cache cleared!")
-
-files = st.file_uploader("Upload files", type=["xlsx", "csv"], accept_multiple_files=True)
-
-if files:
-    # Language Detection Logic
-    try:
-        first_file = files[0]
-        if first_file.name.lower().endswith('.csv'):
-            sample_df = read_csv_robust(first_file).head(5)
-        else:
-            sample_df = pd.read_excel(first_file).head(5)
-        
-        sample_text = ""
-        for val in sample_df.values.flatten():
-            if isinstance(val, str) and len(val) > 5:
-                sample_text = val
-                break
-        detected = detect_lang(sample_text) if sample_text else 'fr'
-    except:
-        detected = 'fr'
-
-    c1, c2 = st.columns(2)
-    with c1:
-        src = st.text_input("Source Language (ISO)", value=detected).lower()
-    with c2:
-        target = st.selectbox("Target Language", ["en", "fr", "es", "de", "it", "pt", "ja", "zh-CN"], index=0)
-
-    if st.button("🚀 Start Global Translation", type="primary", use_container_width=True):
-        processed_files = {}
-        
-        for file in files:
-            ticker = st.empty()
-            try:
-                if file.name.lower().endswith('.csv'):
-                    df = read_csv_robust(file)
-                    for col in df.columns:
-                        if df[col].dtype == 'object':
-                            df[col] = translate_batch(df[col].tolist(), src, target, ticker)
-                    processed_files[file.name] = df
-                else:
-                    excel_reader = pd.ExcelFile(file)
-                    all_sheets = {}
-                    for sheet_name in excel_reader.sheet_names:
-                        ticker.write(f"📖 Reading Sheet: `{sheet_name}`...")
-                        df = pd.read_excel(file, sheet_name=sheet_name)
-                        for col in df.columns:
-                            if df[col].dtype == 'object':
-                                df[col] = translate_batch(df[col].tolist(), src, target, ticker)
-                        all_sheets[sheet_name] = df
-                    processed_files[file.name] = all_sheets
-                
-                ticker.success(f"✅ Finished: {file.name}")
-            except Exception as e:
-                st.error(f"Fatal error in {file.name}: {e}")
-
-        st.session_state.results = processed_files
-
-# --- 5. DOWNLOAD ---
-if "results" in st.session_state:
-    st.divider()
-    st.subheader("📥 Download Results")
-    cols = st.columns(3)
+    st.title("Translet")
+    st.markdown("---")
+    st.subheader("Navigation")
+    if st.button("🏠 Home", use_container_width=True):
+        st.session_state.step = "welcome"; st.rerun()
+    if st.button("📂 New Translation", use_container_width=True):
+        st.session_state.step = "upload"; st.rerun()
     
-    for i, (fname, content) in enumerate(st.session_state.results.items()):
-        with cols[i % 3]:
-            buf = io.BytesIO()
-            if fname.lower().endswith('.csv'):
-                content.to_csv(buf, index=False, encoding='utf-8-sig')
-                mime_type = "text/csv"
-            else:
-                with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-                    for s_name, s_df in content.items():
-                        s_df.to_excel(writer, sheet_name=s_name, index=False)
-                mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    st.markdown("---")
+    st.subheader("📜 Session History")
+    if not st.session_state.history:
+        st.caption("No history yet.")
+    else:
+        for item in reversed(st.session_state.history):
+            with st.expander(f"📄 {item['name'][:15]}..."):
+                st.caption(f"Translated to: {item['target_name']}")
+                st.download_button("Download", item['data'], f"translet_{item['name']}", item['mime'], key=f"h_{item['timestamp']}")
+    
+    if st.session_state.history and st.button("🗑️ Clear History", use_container_width=True):
+        st.session_state.history = []; st.rerun()
+
+# --- 4. HELPERS ---
+def trigger_auto_download(filename, data, mime):
+    b64 = base64.b64encode(data).decode()
+    dl_link = f"<script>var a=document.createElement('a');a.href='data:{mime};base64,{b64}';a.download='{filename}';document.body.appendChild(a);a.click();document.body.removeChild(a);</script>"
+    st.components.v1.html(dl_link, height=0)
+
+def translate_block(text, src, target):
+    if not text or len(str(text).strip()) < 2: return text
+    clean_text = str(text).strip()
+    cache_key = (f"{src}-{target}", clean_text)
+    if cache_key in st.session_state.local_cache: return st.session_state.local_cache[cache_key]
+    try:
+        time.sleep(0.05)
+        res = GoogleTranslator(source=src, target=target).translate(clean_text)
+        st.session_state.local_cache[cache_key] = res
+        return res
+    except: return text
+
+# --- 5. MULTI-SCREEN UI ---
+
+# WELCOME
+if st.session_state.step == "welcome":
+    st.markdown('<div style="height:10vh;"></div>', unsafe_allow_html=True)
+    st.markdown("""<div class="splash-card">
+        <h1 style='font-size: 4rem; background: -webkit-linear-gradient(#007AFF, #00C7BE); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>Translet</h1>
+        <p style='font-size: 1.2rem; color: #6e6e73;'>Professional grade translation for modern workflows.</p>
+    </div>""", unsafe_allow_html=True)
+    _, col2, _ = st.columns([1, 0.6, 1])
+    with col2:
+        if st.button("Start Now", use_container_width=True):
+            st.session_state.step = "upload"; st.rerun()
+
+# UPLOAD
+elif st.session_state.step == "upload":
+    st.title("📂 New Translation Task")
+    col_left, col_right = st.columns([1.2, 1], gap="large")
+    
+    with col_left:
+        st.subheader("1. Source Documents")
+        files = st.file_uploader("Upload CSV, XLSX, DOCX, or PDF", type=["xlsx", "csv", "docx", "pdf"], accept_multiple_files=True)
+        
+    with col_right:
+        st.subheader("2. Language Settings")
+        # Use full names for source and target
+        src_label = st.selectbox("Source Language", options=list(LANG_MAP.keys()), index=0)
+        target_label = st.selectbox("Target Language", options=[k for k in LANG_MAP.keys() if k != "Auto Detect"], index=0)
+        
+        if files:
+            st.markdown("---")
+            if st.button("🚀 Process Batch", use_container_width=True):
+                st.session_state.files = files
+                st.session_state.src_code = LANG_MAP[src_label]
+                st.session_state.target_code = LANG_MAP[target_label]
+                st.session_state.target_name = target_label
+                st.session_state.step = "processing"; st.rerun()
+
+# PROCESSING
+elif st.session_state.step == "processing":
+    
+    st.title("⚙️ Translating...")
+    results = {}
+    progress = st.progress(0)
+    
+    for idx, file in enumerate(st.session_state.files):
+        with st.status(f"Translating `{file.name}`...", expanded=True) as status:
+            # Logic for DOCX, PDF, and Data (XLSX/CSV)
+            if file.name.endswith(".docx"):
+                doc = Document(file)
+                for p in doc.paragraphs:
+                    if p.text.strip(): p.text = translate_block(p.text, st.session_state.src_code, st.session_state.target_code)
+                for table in doc.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            for p in cell.paragraphs:
+                                if p.text.strip(): p.text = translate_block(p.text, st.session_state.src_code, st.session_state.target_code)
+                out = io.BytesIO(); doc.save(out)
+                data, mime = out.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+            elif file.name.endswith(".pdf"):
+                pdf_doc = fitz.open(stream=file.read(), filetype="pdf")
+                packet = io.BytesIO(); can = canvas.Canvas(packet, pagesize=letter)
+                for page in pdf_doc:
+                    text = page.get_text()
+                    trans = translate_block(text, st.session_state.src_code, st.session_state.target_code)
+                    t = can.beginText(50, 750); t.setFont("Helvetica", 10)
+                    for line in trans.split('\n'): t.textLine(line[:100])
+                    can.drawText(t); can.showPage()
+                can.save()
+                data, mime = packet.getvalue(), "application/pdf"
+
+            elif file.name.endswith((".csv", ".xlsx")):
+                df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
+                cols = df.select_dtypes(include=['object']).columns
+                for col in cols:
+                    df[col] = df[col].apply(lambda x: translate_block(x, st.session_state.src_code, st.session_state.target_code))
+                out = io.BytesIO()
+                if file.name.endswith(".csv"):
+                    df.to_csv(out, index=False); mime = "text/csv"
+                else:
+                    df.to_excel(out, index=False); mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                data = out.getvalue()
             
-            st.download_button(
-                label=f"💾 {fname}",
-                data=buf.getvalue(),
-                file_name=f"translated_{fname}",
-                mime=mime_type,
-                key=f"dl_{i}",
-                use_container_width=True
-            )
+            results[file.name] = (data, mime)
+            st.session_state.history.append({"name": file.name, "data": data, "mime": mime, "target_name": st.session_state.target_name, "timestamp": time.time()})
+            status.update(label=f"✅ {file.name} Finished", state="complete")
+            progress.progress((idx + 1) / len(st.session_state.files))
+
+    st.session_state.final_results = results
+    st.session_state.step = "results"; st.rerun()
+
+# RESULTS
+elif st.session_state.step == "results":
+    st.balloons()
+    st.title("🎉 Ready for Download")
+    for name, (data, mime) in st.session_state.final_results.items():
+        trigger_auto_download(f"translet_{name}", data, mime)
+    
+    grid = st.columns(3)
+    for i, (name, (data, mime)) in enumerate(st.session_state.final_results.items()):
+        with grid[i % 3]:
+            st.info(f"📄 {name}")
+            st.download_button("Download Again", data, f"translet_{name}", mime, key=f"res_{i}")
+    
+    st.divider()
+    if st.button("✨ Upload New Translation"):
+        st.session_state.step = "upload"; st.rerun()
